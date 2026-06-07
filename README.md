@@ -2,6 +2,10 @@
 
 Small experimental Python wrapper around `pynostr`.
 
+This project builds on an older Agora-era codebase:
+[agora3/agora-py-nostr](https://github.com/agora3/agora-py-nostr), developed
+for Agora experiments during 2021-2023.
+
 This project is still a work in progress. Treat scripts that publish events or send
 DMs as real Nostr actions: they use the private key from `.env`.
 

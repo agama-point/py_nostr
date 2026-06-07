@@ -103,6 +103,7 @@ class Client():
         self.contacts_for_relay = {}
         self.contact_timeout = 0
         self.contacts_last = -1
+        self.last_send_status = None
         #today = datetime.now()
         #since = today.timestamp()
         
@@ -400,15 +401,25 @@ class Client():
                     rdm.decrypt(self.sender_pk.hex(), public_key_hex=self.recipient.hex())
                     print(f"New dm received:{event.date_time()} {rdm.cleartext_content}")
         elif message_type == RelayMessageType.OK:
+            self.last_relay_ok = message_json
             print(message_json)
         elif message_type == RelayMessageType.NOTICE:
             print(message_json)
 
 
-    def send_direct_message(self, recipient_str, msg, relay=""):
+    def send_direct_message(self, recipient_str, msg, relay="", verbose=False):
         if DEBUG: print("[class DEBUG] send_direct_message()")
         self.sender_pk = self.private_key #sender_pk = PrivateKey.from_hex(NOSTR_SEC)
         self.recipient = get_public_key(recipient_str) #public_key = sender_pk.public_key 
+        self.last_relay_ok = None
+        self.last_send_status = {
+            "event": None,
+            "relay": relay,
+            "sent": False,
+            "ok": None,
+            "status": "created",
+            "detail": "",
+        }
         if DEBUG:
             if self.recipient != "":
                 print(f"[class DEBUG] recipient is set to {self.recipient.bech32()}")
@@ -421,6 +432,24 @@ class Client():
         dm.encrypt( self.sender_pk.hex(), cleartext_content=msg, recipient_pubkey=self.recipient.hex(), )
         dm_event = dm.to_event()
         dm_event.sign(self.sender_pk.hex())   
+        self.last_send_status["event"] = dm_event
+
+        if verbose:
+            print("-"*39)
+            print("[DM DEBUG] sender pub npub:", self.sender_pk.public_key.bech32())
+            print("[DM DEBUG] sender pub hex: ", self.sender_pk.public_key.hex())
+            print("[DM DEBUG] recipient npub:  ", self.recipient.bech32())
+            print("[DM DEBUG] recipient hex:   ", self.recipient.hex())
+            print("[DM DEBUG] message length:  ", len(msg))
+            print("[DM DEBUG] filter:          ", self.filters)
+            print("[DM DEBUG] event id:        ", dm_event.id)
+            print("[DM DEBUG] event kind:      ", dm_event.kind)
+            print("[DM DEBUG] event created_at:", dm_event.created_at)
+            print("[DM DEBUG] event tags:      ", dm_event.tags)
+            print("[DM DEBUG] event sig:       ", dm_event.sig)
+            print("[DM DEBUG] encrypted bytes: ", len(dm_event.content))
+            print("[DM DEBUG] event message:")
+            print(dm_event.to_message())
 
         if relay == "":
             if DEBUG: print("[class DEBUG] list of relays")
@@ -436,13 +465,28 @@ class Client():
         else:
             if DEBUG: print("[class DEBUG] single relay", relay) # only for testing
             if relay == "R": relay = RELAY_URL
-            self.r = Relay(relay, self.message_pool, self.io_loop, self.policy, timeout=5, close_on_eose=False, message_callback=self.print_dm, )
+            self.last_send_status["relay"] = relay
+            if verbose:
+                print("[DM DEBUG] relay resolved:  ", relay)
+            self.r = Relay(relay, self.message_pool, self.io_loop, self.policy, timeout=5, close_on_eose=True, message_callback=self.print_dm, )
             
             self.r.publish(dm_event.to_message())
             self.r.add_subscription(self.subscription_id, self.filters)
             
             # temp. modifik - ToDo better
             self.io_loop_run()
+            self.last_send_status["sent"] = self.r.num_sent_events > 0
+            if self.last_relay_ok:
+                self.last_send_status["ok"] = bool(self.last_relay_ok[2])
+                self.last_send_status["detail"] = str(self.last_relay_ok[3])
+                self.last_send_status["status"] = "ok" if self.last_send_status["ok"] else "rejected"
+            elif self.last_send_status["sent"]:
+                self.last_send_status["status"] = "unknown"
+                self.last_send_status["detail"] = "event was written to websocket, but relay OK was not received"
+            else:
+                self.last_send_status["status"] = "failed"
+                self.last_send_status["detail"] = "event was not written to websocket"
+        return dm_event
     
 
     def recieve_message(self, recipient_str, relay=""):    
@@ -492,15 +536,20 @@ class Client():
         print_table(table)
 
 
-    def io_loop_run(self):
+    def io_loop_run(self, timeout=12):
         if DEBUG: print("[class DEBUG] io_loop")
         try:            
-            self.io_loop.run_sync(self.r.connect) # Err. Operation timed out after None seconds
+            self.io_loop.run_sync(self.r.connect, timeout=timeout) # Err. Operation timed out after None seconds
             #sleep(2)
             #self.io_loop.stop()
+        except gen.TimeoutError:
+            print(f"[class DEBUG] io_loop timeout after {timeout}s - closing relay")
         except gen.Return:
             pass
+        try:
+            if self.r.is_connected:
+                self.io_loop.run_sync(self.r.close, timeout=2)
+        except gen.TimeoutError:
+            print("[class DEBUG] relay close timeout")
         self.io_loop.stop()
-        self.io_loop.clear_current()
-        self.r.close()
-        if DEBUG: print("[class DEBUG] io_loop - stop / clear")
+        if DEBUG: print("[class DEBUG] io_loop - stop")

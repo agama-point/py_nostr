@@ -8,8 +8,8 @@ DMs as real Nostr actions: they use the private key from `.env`.
 ## Install
 
 ```bash
-git clone https://github.com/agora3/agora-py-nostr.git
-cd agora-py-nostr
+git clone https://github.com/agama-point/py_nostr.git
+cd py_nostr
 
 python -m venv venv
 # Windows PowerShell:
@@ -150,6 +150,8 @@ Useful scripts:
 nostr_1_keys.py       local key smoke test
 nostr_keys.py         interactive key console
 nostr_2_event.py      publish a text note
+nostr_dm.py           interactive NIP-17/NIP-44 DM console: test relay, send, recieve
+nostr_main_stream.py  listen to the public kind 1 main stream
 nostr_key_gen.py      generate a new keypair
 nostr_publish_event.py older publish example
 ```

@@ -1,0 +1,7 @@
+"""
+$ python nostr_key_gen.py
+...
+=> YOUR NEW KEY
+"""
+
+NOSTR_SEC = "------ YOUR SECRET KEY -------"

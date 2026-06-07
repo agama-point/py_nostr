@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
 from nostr_worker import NostrWorker
 
 
-VER = "0.1 | 2026-06"
+VER = "0.2 | 2026-06"
 STREAM_CHANNELS = [
     "Public notes",
     "My notes",
@@ -49,6 +49,303 @@ def compact(value: Any, left: int = 18, right: int = 8) -> str:
     return f"{text[:left]}...{text[-right:]}"
 
 
+QR_ECC_CODEWORDS_PER_BLOCK_L = [
+    0,
+    7, 10, 15, 20, 26, 18, 20, 24, 30, 18,
+    20, 24, 26, 30, 22, 24, 28, 30, 28, 28,
+    28, 28, 28, 30, 30, 26, 28, 30, 30, 30,
+    30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+]
+QR_NUM_ERROR_CORRECTION_BLOCKS_L = [
+    0,
+    1, 1, 1, 1, 1, 2, 2, 2, 2, 4,
+    4, 4, 4, 4, 6, 6, 6, 6, 7, 8,
+    8, 9, 9, 10, 12, 12, 12, 13, 14, 15,
+    16, 17, 18, 19, 19, 20, 21, 22, 24, 25,
+]
+
+
+def _qr_alignment_positions(version: int) -> list[int]:
+    if version == 1:
+        return []
+    count = version // 7 + 2
+    step = 26 if version == 32 else ((version * 4 + count * 2 + 1) // (count * 2 - 2)) * 2
+    result = [6]
+    position = version * 4 + 10
+    for _ in range(count - 1):
+        result.insert(1, position)
+        position -= step
+    return result
+
+
+def _qr_raw_codewords(version: int) -> int:
+    modules = (16 * version + 128) * version + 64
+    if version >= 2:
+        align_count = version // 7 + 2
+        modules -= (25 * align_count - 10) * align_count - 55
+    if version >= 7:
+        modules -= 36
+    return modules // 8
+
+
+def _qr_data_codewords(version: int) -> int:
+    return (
+        _qr_raw_codewords(version)
+        - QR_ECC_CODEWORDS_PER_BLOCK_L[version] * QR_NUM_ERROR_CORRECTION_BLOCKS_L[version]
+    )
+
+
+def _qr_bits_append(bits: list[int], value: int, length: int) -> None:
+    for i in reversed(range(length)):
+        bits.append((value >> i) & 1)
+
+
+def _qr_gf_multiply(x: int, y: int) -> int:
+    z = 0
+    for i in reversed(range(8)):
+        z = (z << 1) ^ ((z >> 7) * 0x11D)
+        z ^= ((y >> i) & 1) * x
+    return z & 0xFF
+
+
+def _qr_reed_solomon_divisor(degree: int) -> list[int]:
+    result = [0] * (degree - 1) + [1]
+    root = 1
+    for _ in range(degree):
+        result.append(0)
+        for j in range(degree):
+            result[j] = _qr_gf_multiply(result[j], root)
+            if j + 1 < len(result):
+                result[j] ^= result[j + 1]
+        root = _qr_gf_multiply(root, 0x02)
+    return result[:degree]
+
+
+def _qr_reed_solomon_remainder(data: list[int], divisor: list[int]) -> list[int]:
+    result = [0] * len(divisor)
+    for byte in data:
+        factor = byte ^ result.pop(0)
+        result.append(0)
+        for i, coeff in enumerate(divisor):
+            result[i] ^= _qr_gf_multiply(coeff, factor)
+    return result
+
+
+def _qr_add_ecc(data: list[int], version: int) -> list[int]:
+    raw_codewords = _qr_raw_codewords(version)
+    block_count = QR_NUM_ERROR_CORRECTION_BLOCKS_L[version]
+    ecc_len = QR_ECC_CODEWORDS_PER_BLOCK_L[version]
+    short_block_len = raw_codewords // block_count
+    short_data_len = short_block_len - ecc_len
+    short_block_count = block_count - raw_codewords % block_count
+    divisor = _qr_reed_solomon_divisor(ecc_len)
+
+    blocks = []
+    offset = 0
+    for i in range(block_count):
+        data_len = short_data_len + (0 if i < short_block_count else 1)
+        block_data = data[offset : offset + data_len]
+        offset += data_len
+        pad = [None] if i < short_block_count else []
+        blocks.append(block_data + pad + _qr_reed_solomon_remainder(block_data, divisor))
+
+    result = []
+    max_len = max(len(block) for block in blocks)
+    for i in range(max_len):
+        for block in blocks:
+            if i < len(block) and block[i] is not None:
+                result.append(block[i])
+    return result
+
+
+def _qr_format_bits(mask: int) -> int:
+    data = (1 << 3) | mask
+    rem = data
+    for _ in range(10):
+        rem = (rem << 1) ^ ((rem >> 9) * 0x537)
+    return ((data << 10) | rem) ^ 0x5412
+
+
+def _qr_version_bits(version: int) -> int:
+    rem = version
+    for _ in range(12):
+        rem = (rem << 1) ^ ((rem >> 11) * 0x1F25)
+    return (version << 12) | rem
+
+
+def make_qr_matrix(text: str) -> list[list[bool]]:
+    data_bytes = text.encode("utf-8")
+    version = 0
+    for candidate in range(1, 41):
+        count_bits = 8 if candidate <= 9 else 16
+        if 4 + count_bits + len(data_bytes) * 8 <= _qr_data_codewords(candidate) * 8:
+            version = candidate
+            break
+    if version == 0:
+        raise ValueError("Message is too long for one QR code")
+
+    bits: list[int] = []
+    _qr_bits_append(bits, 0x4, 4)
+    _qr_bits_append(bits, len(data_bytes), 8 if version <= 9 else 16)
+    for byte in data_bytes:
+        _qr_bits_append(bits, byte, 8)
+
+    capacity_bits = _qr_data_codewords(version) * 8
+    _qr_bits_append(bits, 0, min(4, capacity_bits - len(bits)))
+    while len(bits) % 8:
+        bits.append(0)
+
+    data = []
+    for i in range(0, len(bits), 8):
+        data.append(int("".join(str(bit) for bit in bits[i : i + 8]), 2))
+    pad = 0xEC
+    while len(data) < _qr_data_codewords(version):
+        data.append(pad)
+        pad ^= 0xEC ^ 0x11
+    codewords = _qr_add_ecc(data, version)
+
+    size = version * 4 + 17
+    modules: list[list[bool | None]] = [[None] * size for _ in range(size)]
+    function = [[False] * size for _ in range(size)]
+
+    def set_module(x: int, y: int, value: bool, is_function: bool = True) -> None:
+        if 0 <= x < size and 0 <= y < size:
+            modules[y][x] = value
+            function[y][x] = is_function
+
+    def draw_finder(cx: int, cy: int) -> None:
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                dist = max(abs(dx), abs(dy))
+                set_module(cx + dx, cy + dy, dist != 2 and dist != 4)
+
+    def draw_alignment(cx: int, cy: int) -> None:
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                set_module(cx + dx, cy + dy, max(abs(dx), abs(dy)) != 1)
+
+    draw_finder(3, 3)
+    draw_finder(size - 4, 3)
+    draw_finder(3, size - 4)
+    for i in range(8, size - 8):
+        set_module(6, i, i % 2 == 0)
+        set_module(i, 6, i % 2 == 0)
+    alignment_positions = _qr_alignment_positions(version)
+    for y in alignment_positions:
+        for x in alignment_positions:
+            if modules[y][x] is None:
+                draw_alignment(x, y)
+    set_module(8, size - 8, True)
+
+    for i in range(15):
+        set_module(8, i if i < 6 else i + 1 if i < 8 else size - 15 + i, False)
+        set_module(size - 1 - i if i < 8 else 15 - i, 8, False)
+    if version >= 7:
+        bits_version = _qr_version_bits(version)
+        for i in range(18):
+            bit = ((bits_version >> i) & 1) != 0
+            set_module(size - 11 + i % 3, i // 3, bit)
+            set_module(i // 3, size - 11 + i % 3, bit)
+
+    bit_index = 0
+    direction = -1
+    x = size - 1
+    while x > 0:
+        if x == 6:
+            x -= 1
+        for y_offset in range(size):
+            y = size - 1 - y_offset if direction == -1 else y_offset
+            for dx in range(2):
+                xx = x - dx
+                if function[y][xx]:
+                    continue
+                bit = False
+                if bit_index < len(codewords) * 8:
+                    bit = ((codewords[bit_index >> 3] >> (7 - (bit_index & 7))) & 1) != 0
+                    bit_index += 1
+                if (xx + y) % 2 == 0:
+                    bit = not bit
+                set_module(xx, y, bit, False)
+        direction *= -1
+        x -= 2
+
+    format_bits = _qr_format_bits(0)
+    for i in range(15):
+        bit = ((format_bits >> i) & 1) != 0
+        set_module(8, i if i < 6 else i + 1 if i < 8 else size - 15 + i, bit)
+        set_module(size - 1 - i if i < 8 else 15 - i, 8, bit)
+
+    return [[cell is True for cell in row] for row in modules]
+
+
+def qr_matrix_pixmap(matrix: list[list[bool]], scale: int, border: int = 4) -> QPixmap:
+    size = len(matrix)
+    image_size = (size + border * 2) * scale
+    image = QImage(image_size, image_size, QImage.Format.Format_RGB32)
+    image.fill(QColor("#ffffff"))
+    painter = QPainter(image)
+    painter.fillRect(0, 0, image_size, image_size, QColor("#ffffff"))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#000000"))
+    for y, row in enumerate(matrix):
+        for x, value in enumerate(row):
+            if value:
+                painter.drawRect((x + border) * scale, (y + border) * scale, scale, scale)
+    painter.end()
+    return QPixmap.fromImage(image)
+
+
+def qr_pixmap(text: str, scale: int | None = None, border: int = 4) -> QPixmap:
+    matrix = make_qr_matrix(text)
+    size = len(matrix)
+    if scale is None:
+        scale = max(3, min(8, 900 // (size + border * 2)))
+    return qr_matrix_pixmap(matrix, scale, border)
+
+
+class QrCodeWindow(QWidget):
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self._message = message
+        self._matrix = make_qr_matrix(message)
+        self._border = 4
+        self._last_scale = 0
+
+        self.setWindowTitle("Message QR")
+        self.setMinimumSize(300, 380)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setMinimumSize(240, 240)
+        layout.addWidget(self.image_label, stretch=1)
+
+        self.text_box = QTextEdit()
+        self.text_box.setReadOnly(True)
+        self.text_box.setPlainText(message)
+        self.text_box.setMaximumHeight(110)
+        layout.addWidget(self.text_box)
+
+        initial_size = min(900, max(360, (len(self._matrix) + self._border * 2) * 6 + 36))
+        self.resize(initial_size, initial_size + 150)
+        self._refresh_qr()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._refresh_qr()
+
+    def _refresh_qr(self) -> None:
+        available = min(self.image_label.width(), self.image_label.height())
+        modules = len(self._matrix) + self._border * 2
+        scale = max(1, available // modules)
+        if scale == self._last_scale and self.image_label.pixmap() is not None:
+            return
+        self._last_scale = scale
+        self.image_label.setPixmap(qr_matrix_pixmap(self._matrix, scale, self._border))
+
+
 class MainWindow(QWidget):
     action_requested = pyqtSignal(str, object)
     config_changed = pyqtSignal(dict)
@@ -61,6 +358,7 @@ class MainWindow(QWidget):
         self.setMinimumSize(980, 620)
         self._config: dict[str, Any] = {}
         self._message_rows: list[dict[str, Any]] = []
+        self._qr_windows: list[QWidget] = []
         self._build_ui()
         self._apply_theme()
 
@@ -261,6 +559,9 @@ class MainWindow(QWidget):
         self.setup_label = QLabel("setup.json")
         self.setup_label.setObjectName("Muted")
         footer_layout.addWidget(self.setup_label)
+        hint_label = QLabel("| right_click: Show QR / Copy / Delete message")
+        hint_label.setObjectName("Muted")
+        footer_layout.addWidget(hint_label)
         footer_layout.addStretch()
         layout.addWidget(footer)
         return panel
@@ -342,9 +643,13 @@ class MainWindow(QWidget):
         self.messages_table.selectRow(row)
         row_data = self._message_rows[row]
         menu = QMenu(self)
-        copy_action = menu.addAction("copy msg")
-        delete_action = menu.addAction("delete")
+        show_qr_action = menu.addAction("Show QR")
+        copy_action = menu.addAction("Copy message")
+        delete_action = menu.addAction("Delete message")
         selected = menu.exec(self.messages_table.viewport().mapToGlobal(position))
+        if selected == show_qr_action:
+            self.show_message_qr(str(row_data.get("content") or ""))
+            return
         if selected == copy_action:
             QApplication.clipboard().setText(str(row_data.get("content") or ""))
             return
@@ -356,6 +661,19 @@ class MainWindow(QWidget):
                     "uid": str(row_data.get("uid") or ""),
                 },
             )
+
+    def show_message_qr(self, message: str) -> None:
+        if not message:
+            self.append_debug("QR skipped: message is empty", "warn")
+            return
+        try:
+            window = QrCodeWindow(message)
+        except ValueError as exc:
+            self.append_debug(f"QR skipped: {exc}", "warn")
+            return
+
+        window.show()
+        self._qr_windows.append(window)
 
     def append_debug(self, text: str, level: str = "info") -> None:
         colors = {

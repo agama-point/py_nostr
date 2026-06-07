@@ -125,6 +125,18 @@ def env_keys(prefix: str) -> list[str]:
     return preferred + [name for name in keys if name not in preferred]
 
 
+def recipient_env_keys() -> list[str]:
+    load_env_file()
+    preferred = ["NOSTR_PUB1", "NOSTR_PUB2", "NOSTR_PUB3"]
+    existing = [name for name in preferred if name in os.environ]
+    extras = sorted(
+        name
+        for name in os.environ
+        if name.startswith("NOSTR_PUB") and name not in preferred and name != "NOSTR_PUB"
+    )
+    return existing + extras
+
+
 class NostrWorker(QObject):
     log_signal = pyqtSignal(str, str)
     status_signal = pyqtSignal(str)
@@ -149,7 +161,7 @@ class NostrWorker(QObject):
         load_env_file()
         self.config_signal.emit(dict(self.config))
         self.keys_signal.emit(env_keys("NOSTR_KEY"))
-        self.recipients_signal.emit(env_keys("NOSTR_PUB"))
+        self.recipients_signal.emit(recipient_env_keys())
         self.relays_signal.emit(relays_list[:3])
         self.refresh_messages_for_config()
         self.status_signal.emit("Ready")

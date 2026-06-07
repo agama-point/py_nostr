@@ -6,3 +6,4 @@ python-dotenv==1.2.2
 requests==2.34.2
 rich==15.0.0
 tornado==6.5.6
+PyQt6==6.10.0

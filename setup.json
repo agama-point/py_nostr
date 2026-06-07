@@ -1,8 +1,8 @@
 {
   "key_env": "NOSTR_KEY",
   "relay": "wss://relay.damus.io",
-  "recipient": "NOSTR_PUB2",
+  "recipient": "NOSTR_PUB3",
   "custom_recipient": "",
-  "stream_channel": "Public notes",
-  "verbose": true
+  "stream_channel": "My notes",
+  "verbose": false
 }

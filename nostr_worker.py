@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import threading
 import uuid
 from datetime import datetime
@@ -32,6 +33,7 @@ from pynostr.relay import Relay
 
 
 SETUP_PATH = Path("setup.json")
+DATA_DIR = Path("data")
 DEFAULT_SETUP = {
     "key_env": "NOSTR_KEY",
     "relay": relays_list[0] if relays_list else "",
@@ -56,11 +58,38 @@ def utc_time(timestamp: int | None) -> str:
     return datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def compact_time(timestamp: int | None) -> str:
+    if not timestamp:
+        return "?"
+    return datetime.fromtimestamp(timestamp).strftime("%y%m%d|%H:%M")
+
+
+def one_line(value: Any, limit: int = 500) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}..."
+
+
 def short(value: str, left: int = 12, right: int = 8) -> str:
     value = str(value)
     if len(value) <= left + right + 3:
         return value
     return f"{value[:left]}...{value[-right:]}"
+
+
+def peer_db_name(public_key: PublicKey) -> str:
+    npub = public_key.bech32()
+    return f"{npub[:15]}_{npub[-6:]}.sqlite"
+
+
+def peer_db_path(public_key: PublicKey) -> Path:
+    DATA_DIR.mkdir(exist_ok=True)
+    return DATA_DIR / peer_db_name(public_key)
+
+
+def public_key_from_hex(value: str) -> PublicKey:
+    return PublicKey.from_hex(str(value).lower())
 
 
 def load_setup() -> dict[str, Any]:
@@ -104,6 +133,7 @@ class NostrWorker(QObject):
     relays_signal = pyqtSignal(list)
     recipients_signal = pyqtSignal(list)
     stream_state_signal = pyqtSignal(bool)
+    messages_signal = pyqtSignal(list)
 
     def __init__(self) -> None:
         super().__init__()
@@ -121,6 +151,7 @@ class NostrWorker(QObject):
         self.keys_signal.emit(env_keys("NOSTR_KEY"))
         self.recipients_signal.emit(env_keys("NOSTR_PUB"))
         self.relays_signal.emit(relays_list[:3])
+        self.refresh_messages_for_config()
         self.status_signal.emit("Ready")
         self.log("Nostr Qt app initialized.")
         self.log(f"Setup file: {SETUP_PATH.resolve()}", "muted")
@@ -135,6 +166,8 @@ class NostrWorker(QObject):
     def update_config(self, patch: dict) -> None:
         self.config.update(patch)
         save_setup(self.config)
+        if {"recipient", "custom_recipient"} & set(patch):
+            self.refresh_messages_for_config()
 
     @pyqtSlot()
     def shutdown(self) -> None:
@@ -153,6 +186,8 @@ class NostrWorker(QObject):
                 self.send_message(payload)
             elif action == "receive_messages":
                 self.start_receive(payload)
+            elif action == "delete_message":
+                self.delete_message(payload)
             elif action == "start_stream":
                 self.start_stream(payload)
             elif action == "stop_stream":
@@ -176,6 +211,144 @@ class NostrWorker(QObject):
     def private_key_from_env(self, key_env: str | None = None) -> PrivateKey:
         raw = get_nostr_key(key_env or str(self.config["key_env"]))
         return PrivateKey.from_hex(normalize_nostr_private_key(raw))
+
+    def resolve_recipient_value(self, recipient_env: str | None = None, recipient_value: str | None = None) -> str:
+        value = str(recipient_value or "").strip()
+        env_name = str(recipient_env or self.config.get("recipient") or "").strip()
+        if value.startswith("NOSTR_PUB"):
+            env_name = value
+            value = ""
+        if not value and env_name:
+            value = get_nostr_key(env_name)
+        return value
+
+    def refresh_messages_for_config(self) -> None:
+        try:
+            value = self.resolve_recipient_value(
+                str(self.config.get("recipient") or ""),
+                str(self.config.get("custom_recipient") or ""),
+            )
+            if not value:
+                self.messages_signal.emit([])
+                return
+            self.emit_messages(parse_public_key(value))
+        except Exception:
+            self.messages_signal.emit([])
+
+    def ensure_message_db(self, peer: PublicKey) -> Path:
+        db_path = peer_db_path(peer)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uid TEXT NOT NULL UNIQUE,
+                    direction TEXT NOT NULL CHECK(direction IN ('S', 'R')),
+                    created_at INTEGER,
+                    datetime_text TEXT,
+                    content TEXT NOT NULL,
+                    peer_npub TEXT NOT NULL,
+                    peer_hex TEXT NOT NULL,
+                    sender_hex TEXT,
+                    recipient_hex TEXT,
+                    rumor_id TEXT,
+                    event_id TEXT,
+                    wrap_id TEXT,
+                    sender_wrap_id TEXT,
+                    seal_id TEXT,
+                    relay TEXT,
+                    inserted_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_uid ON messages(uid)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at DESC)")
+        return db_path
+
+    def store_message(
+        self,
+        peer: PublicKey,
+        direction: str,
+        content: str,
+        created_at: int | None,
+        relay_url: str,
+        sender_hex: str | None = None,
+        recipient_hex: str | None = None,
+        rumor_id: str | None = None,
+        event_id: str | None = None,
+        wrap_id: str | None = None,
+        sender_wrap_id: str | None = None,
+        seal_id: str | None = None,
+    ) -> bool:
+        db_path = self.ensure_message_db(peer)
+        uid = rumor_id or event_id or uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{direction}|{created_at}|{sender_hex}|{recipient_hex}|{content}",
+        ).hex
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO messages (
+                    uid, direction, created_at, datetime_text, content, peer_npub, peer_hex,
+                    sender_hex, recipient_hex, rumor_id, event_id, wrap_id, sender_wrap_id,
+                    seal_id, relay, inserted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    uid,
+                    direction,
+                    created_at,
+                    compact_time(created_at),
+                    content,
+                    peer.bech32(),
+                    peer.hex(),
+                    sender_hex,
+                    recipient_hex,
+                    rumor_id,
+                    event_id,
+                    wrap_id,
+                    sender_wrap_id,
+                    seal_id,
+                    relay_url,
+                    int(datetime.now().timestamp()),
+                ),
+            )
+            inserted = cursor.rowcount > 0
+        self.emit_messages(peer)
+        return inserted
+
+    def load_messages(self, peer: PublicKey, limit: int = 300) -> list[dict[str, Any]]:
+        db_path = self.ensure_message_db(peer)
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT direction, datetime_text, content, uid, peer_npub, rumor_id, event_id, wrap_id,
+                       sender_wrap_id, seal_id, relay
+                FROM messages
+                ORDER BY COALESCE(created_at, inserted_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def emit_messages(self, peer: PublicKey) -> None:
+        self.messages_signal.emit(self.load_messages(peer))
+
+    def delete_message(self, payload: dict[str, Any]) -> None:
+        peer_npub = str(payload.get("peer_npub") or "").strip()
+        uid = str(payload.get("uid") or "").strip()
+        if not peer_npub or not uid:
+            self.log("delete skipped: missing peer or uid", "warn")
+            return
+        peer = parse_public_key(peer_npub)
+        db_path = self.ensure_message_db(peer)
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute("DELETE FROM messages WHERE uid = ?", (uid,))
+            deleted = cursor.rowcount
+        self.emit_messages(peer)
+        self.log(f"message delete: {short(uid)} from {db_path} ({deleted} row)", "muted")
 
     def key_info(self, key_env: str) -> None:
         self.status_signal.emit("Reading key")
@@ -219,13 +392,8 @@ class NostrWorker(QObject):
 
     def send_message(self, payload: dict[str, Any]) -> None:
         relay_url = str(payload.get("relay") or self.config["relay"])
-        recipient_value = str(payload.get("recipient_value") or "").strip()
         recipient_env = str(payload.get("recipient_env") or self.config.get("recipient") or "").strip()
-        if recipient_value.startswith("NOSTR_PUB"):
-            recipient_env = recipient_value
-            recipient_value = ""
-        if not recipient_value and recipient_env:
-            recipient_value = get_nostr_key(recipient_env)
+        recipient_value = self.resolve_recipient_value(recipient_env, str(payload.get("recipient_value") or ""))
         message = str(payload.get("message") or "").strip()
         if not message:
             raise ValueError("Message is empty")
@@ -258,6 +426,24 @@ class NostrWorker(QObject):
         self.log(f"sender copy:    {sender_wrap.id}")
         statuses = self.publish_events(relay_url, [wrap, sender_wrap])
         self.log(pformat(statuses, width=90, sort_dicts=True))
+        inserted = self.store_message(
+            recipient,
+            "S",
+            message,
+            int(rumor.get("created_at") or datetime.now().timestamp()),
+            relay_url,
+            sender_hex=sender_key.public_key.hex(),
+            recipient_hex=recipient.hex(),
+            rumor_id=str(rumor.get("id") or ""),
+            event_id=wrap.id,
+            wrap_id=wrap.id,
+            sender_wrap_id=sender_wrap.id,
+            seal_id=seal.id,
+        )
+        self.log(
+            f"message db: {peer_db_path(recipient)} ({'inserted' if inserted else 'duplicate'})",
+            "muted",
+        )
         ok_count = sum(1 for status in statuses.values() if status.get("ok") is True)
         self.status_signal.emit(f"Sent {ok_count}/{len(statuses)}")
 
@@ -414,7 +600,7 @@ class NostrWorker(QObject):
             if event.id in seen:
                 return
             seen.add(event.id)
-            self.log_event(event, decrypt_key)
+            self.log_event(event, decrypt_key, relay_url)
 
         def poll_stop():
             if stop_event.is_set() and relay is not None and relay.is_connected:
@@ -446,26 +632,108 @@ class NostrWorker(QObject):
             loop.stop()
             loop.close(all_fds=True)
 
-    def log_event(self, event: Event, decrypt_key: PrivateKey | None = None) -> None:
-        self.log("")
-        self.log("-" * 80)
-        self.log(f"kind: {event.kind} | date: {utc_time(event.created_at)} | id: {short(event.id)}")
-        self.log(f"author: {short(event.pubkey or '')}")
-        if event.tags:
-            self.log("tags: " + json.dumps(event.tags[:12], ensure_ascii=False))
+    def log_event(
+        self,
+        event: Event,
+        decrypt_key: PrivateKey | None = None,
+        relay_url: str = "",
+    ) -> None:
+        self.log("-" * 48, "muted")
+        date_text = compact_time(event.created_at)
+        event_id = event.id or ""
+        author = event.pubkey or ""
+
         if decrypt_key and event.kind == nip17.KIND_GIFT_WRAP:
             try:
                 seal, rumor = nip17.unwrap_gift_wrap(decrypt_key, event)
-                self.log(f"seal sender: {seal.pubkey}")
-                self.log(f"dm clear:    {rumor.get('content')}")
+                content = one_line(rumor.get("content"), 1200 if self.debug_enabled else 500)
+                sender = str(rumor.get("pubkey") or seal.pubkey or "")
+                rumor_id = str(rumor.get("id") or "")
+                self.log(content or "(empty message)")
+                if self.debug_enabled:
+                    self.log(
+                        f"{date_text} / from {sender} / rumor {rumor_id} / wrap {event_id} / seal {seal.id}",
+                        "muted",
+                    )
+                    if rumor.get("tags"):
+                        self.log("tags " + json.dumps(rumor.get("tags"), ensure_ascii=False), "debug")
+                else:
+                    self.log(
+                        f"{date_text} / from {short(sender)} / id {short(rumor_id or event_id)}",
+                        "muted",
+                    )
+                self.store_unwrapped_message(decrypt_key, event, seal, rumor, relay_url)
                 return
             except Exception as exc:
-                self.log(f"decrypt error: {exc!r}", "error")
-        if event.content:
-            self.log(event.content[:2000])
+                self.log(
+                    f"{date_text} / gift-wrap {short(event_id)} / from {short(author)} / decrypt error",
+                    "warn",
+                )
+                self.log(f"{exc!r}", "error")
+                return
+
+        content = one_line(event.content, 1200 if self.debug_enabled else 500)
+        self.log(content or f"(kind {event.kind}, no content)")
+        if self.debug_enabled:
+            self.log(
+                f"{date_text} / kind {event.kind} / from {author} / id {event_id}",
+                "muted",
+            )
+            if event.tags:
+                self.log("tags " + json.dumps(event.tags[:12], ensure_ascii=False), "debug")
+        else:
+            self.log(
+                f"{date_text} / from {short(author)} / kind {event.kind} / id {short(event_id)}",
+                "muted",
+            )
+
+    def store_unwrapped_message(
+        self,
+        my_key: PrivateKey,
+        wrap_event: Event,
+        seal: Event,
+        rumor: dict[str, Any],
+        relay_url: str,
+    ) -> None:
+        my_pub_hex = my_key.public_key.hex()
+        sender_hex = str(rumor.get("pubkey") or seal.pubkey or "")
+        recipient_hex = ""
+        for tag in rumor.get("tags") or []:
+            if tag and tag[0] == "p" and len(tag) > 1:
+                recipient_hex = str(tag[1])
+                break
+
+        if sender_hex == my_pub_hex:
+            direction = "S"
+            peer_hex = recipient_hex
+        else:
+            direction = "R"
+            peer_hex = sender_hex
+            recipient_hex = recipient_hex or my_pub_hex
+        if not peer_hex:
+            self.log("message db skipped: peer key not found in rumor", "warn")
+            return
+
+        peer = public_key_from_hex(peer_hex)
+        inserted = self.store_message(
+            peer,
+            direction,
+            str(rumor.get("content") or ""),
+            int(rumor.get("created_at") or wrap_event.created_at or datetime.now().timestamp()),
+            relay_url,
+            sender_hex=sender_hex,
+            recipient_hex=recipient_hex,
+            rumor_id=str(rumor.get("id") or ""),
+            event_id=wrap_event.id,
+            wrap_id=wrap_event.id,
+            seal_id=seal.id,
+        )
+        self.log(
+            f"message db: {peer_db_path(peer)} ({'inserted' if inserted else 'duplicate'})",
+            "muted",
+        )
 
     def log_section(self, title: str) -> None:
-        self.log("")
         self.log("=" * 80)
         self.log(title)
         self.log("=" * 80)

@@ -26,6 +26,7 @@ def main() -> int:
     worker.relays_signal.connect(window.set_relay_options)
     worker.recipients_signal.connect(window.set_recipient_options)
     worker.stream_state_signal.connect(window.set_stream_state)
+    worker.messages_signal.connect(window.set_messages)
     worker_thread.started.connect(worker.initialize)
 
     app.aboutToQuit.connect(worker.shutdown)

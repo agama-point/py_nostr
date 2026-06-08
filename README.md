@@ -1,5 +1,11 @@
 # agama_nostr
 
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab.svg)
+![Nostr](https://img.shields.io/badge/Nostr-protocol-8e44ad.svg)
+![pynostr](https://img.shields.io/badge/pynostr-0.7.0-2f855a.svg)
+![Purpose](https://img.shields.io/badge/purpose-education%20%26%20testing-orange.svg)
+
 Small experimental Python wrapper around `pynostr`.
 
 This project builds on an older Agora-era codebase:
@@ -160,12 +166,31 @@ nostr_key_gen.py      generate a new keypair
 nostr_publish_event.py older publish example
 ```
 
-## Links
+
+---
+
+[agama-point/agama_linky_sandbox](https://github.com/agama-point/agama_linky_sandbox)
+
+`agama_linky_sandbox` is a local testing and learning sandbox for [hynek-jina/linky](https://github.com/hynek-jina/linky), focused on key derivation, local tooling, and small protocol experiments around Linky's Nostr, Cashu, and Evolu integrations.
+
+🔗 [agama-point/py_nostr](https://github.com/agama-point/py_nostr)
+
+`py_nostr` is a small experimental Python wrapper around `pynostr` for working with Nostr keys, events, relays, publishing, user metadata, and direct messages. It is useful for local protocol experiments, but scripts that publish events or send DMs perform real Nostr actions when configured with a private key.
+
+🔗 [agama-point/py_cashu](https://github.com/agama-point/py_cashu)
+
+`py_cashu` is an educational Python project for exploring Cashu ecash flows: mints, Lightning invoices, blind signatures, proofs, bearer tokens, wallet seed material, and token transfers. It is a console and desktop experiment for understanding the protocol, not a production wallet.
+
+🔗 [octopusengine/py_evolu](https://github.com/octopusengine/py_evolu)
+
+`py_evolu` is a Python experiment around Evolu local-first data, owner mnemonics, SQLite storage, backup export, restore, and relay sync. Because Evolu has no official Python client, it uses a small TypeScript sidecar with the official Evolu packages.
+
+---
+
+
+
+## References
 
 - https://github.com/holgern/pynostr
 - https://github.com/jeffthibault/python-nostr
 - https://github.com/monty888/monstr
-
----
-
-Agora_Zero: `npub1ag0ra0shs0sd24wqwqdceu2yzj3uj5xa53ge2vstz0nyf49ez68qqq2jgj`
